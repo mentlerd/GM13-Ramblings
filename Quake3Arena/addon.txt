@@ -1,0 +1,14 @@
+"AddonInfo"
+{
+	"name"			"Quake 3 Arena"
+
+	"version"		"0"
+	"up_date"		"Never"
+	
+	"author_name"		"MDave [HUN]"
+	"author_email"		""
+	"author_url"		""
+	
+	"info"			"q3dm17! You don't want it already? Then this is not for you.."
+	"override"		"0"
+}
