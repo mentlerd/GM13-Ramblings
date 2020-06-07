@@ -45,7 +45,7 @@ local loadstring = loadstring
 
 -- Config
 local COLOR_GENERIC = { r = 255, g = 255, b = 255 }
-local COLOR_COMMENT = { r = 165, g = 225, b = 45  }
+local COLOR_COMMENT = { r =  30, g = 195, b = 30  }
 
 local COLOR_KEY     = { r = 250, g = 150, b = 30  }
 local COLOR_REF     = { r = 165, g = 225, b = 45  }
@@ -53,7 +53,6 @@ local COLOR_REF     = { r = 165, g = 225, b = 45  }
 local COLOR_BOOLEAN = { r = 175, g = 130, b = 255 }
 local COLOR_NUMBER  = { r = 175, g = 130, b = 255 }
 local COLOR_STRING  = { r = 230, g = 220, b = 115 }
-
 
 -- This object can be used to force the describer to describe nil values
 local NIL_INSTANCE = {}
@@ -320,11 +319,21 @@ function describe(value, out, options)
 
 		-- Functions
 		if isfunction(value) then
+			out:printc(nil, tostring(value))
 
+			-- If the debug library is available, give extra insight on closures
+			if debug and debug.getinfo then
+				local info = debug.getinfo(value, "S")
+
+				-- Print source file for Lua methods
+				if info.what == "Lua" then
+					out:printc(COLOR_COMMENT, string.format("    -- [%s]: %d-%d", info.short_src, info.linedefined, info.lastlinedefined))
+				end
+			end
+
+			out:newl()
+			return
 		end
-
-		-- Generic fallback, print typename and address
-
 
 		-- Fallback
 		out:printc(nil, tostring(value))
@@ -352,7 +361,7 @@ local function error_format(msg, ...)
 	error( string.format(msg, ...), 2 )
 end
 
-function parse_command_options(input, fenv)
+local function parse_command_options(input, fenv)
 	local raw_options = string.match(input, "|(.*)$")
 	local options     = {}
 
@@ -363,10 +372,10 @@ function parse_command_options(input, fenv)
 
 	-- Parse options
 	string.gsub(raw_options, "[^|]+", function(part)
-		local key, value = part:match("^([^=]+)=?(.*)$")
+		local key, value = part:match("([^%s=]+)=?(.*)$")
 
 		-- Trim pair of unwanted spaces
-		key   = key:match("^%s*(.-)%s*$")
+		key   =   key:match("^%s*(.-)%s*$")
 		value = value:match("^%s*(.-)%s*$")
 
 		if value == "" then
@@ -429,12 +438,20 @@ function parse_command_options(input, fenv)
 	return input, options
 end
 
+local function process_returns(res, out, options)
+
+	-- Describe results
+	describe(res, out, options)
+end
+
+local function inst_guard()
+	debug.sethook()
+	error("Too many instructions. Halted")
+end
+
 function lua_command(input, out, fenv)
 	local input         = string.match(input or "", "^%s*(.-)%s*$")
 	local code, options = parse_command_options(input, fenv)
-
-	-- Initialize output stream
-	out:init(options)
 
 	if code == "" then
 		error("No code provided")
@@ -457,8 +474,17 @@ function lua_command(input, out, fenv)
 		error_format("Syntax error: %s", syntax_err)
 	end
 
+	-- Install basic 'infinite loop protection' if the debug lib is available
+	if debug and debug.sethook then
+		debug.sethook(inst_guard, "", 10000000)
+	end
+
 	-- Run code, capture return values
 	local res = { pcall(func) }
+
+	if debug and debug.sethook then
+		debug.sethook()
+	end
 
 	-- Prompt
 	local prefix = res[2] ~= nil and "= " or "<< "
@@ -466,6 +492,9 @@ function lua_command(input, out, fenv)
 	out:printc(COLOR_COMMENT, prefix)
 	out:printc(COLOR_COMMENT, code)
 	out:newl()
+
+	-- Initialize output stream
+	out:init(options)
 
 	-- Report results
 	if not res[1] then
@@ -527,8 +556,8 @@ function lua_command(input, out, fenv)
 			res = res[1]
 		end
 
-		-- Describe results
-		describe(res, out, options)
+		-- Pass for processing
+		process_returns(res, out, options)
 	end
 end
 
@@ -584,10 +613,112 @@ function grep_stream(out, pattern)
 	local line_color
 	local match_color
 
+	local match_pre  = 3
+	local match_post = 3
+
+	local render_all = true
+
+	-- Utility
+	local function find_matches(strings)
+		local merge     = table.concat(strings)
+		local overrides = {}
+
+		if ignorecase then
+			merge = merge:lower()
+		end
+
+		-- Match the grep against our line as long as it does
+		local from = 1
+
+		while true do
+			local start, finish, A, B = string.find(merge, pattern, from, false)
+
+			if not start then
+				break
+			end
+
+			table.insert(overrides, { start = start, finish = finish, color = match_color })
+
+			-- TODO: Find capture groups?
+
+			from = finish +1
+		end
+
+		return overrides
+	end
+
+	local function render_line(colors, strings, overrides)
+		
+		-- No overrides? just render normally
+		if not overrides or not overrides[1] then
+			for part, text in ipairs(strings) do
+				out:printc(colors[part], text)
+			end
+
+			return
+		end
+
+		-- Render output, while watching overrides
+		local part = 1
+		local off  = 1
+
+		local pos = 0
+
+		for _, override in ipairs(overrides) do
+			for idx, text in ipairs_ex(strings, part) do
+				part = idx
+
+				-- Text has part before override start, print normally
+				local start = override.start - pos -1
+				local len   = text:len()
+
+				if start > 0 then
+					local chars = math.min(len - off +1, start)
+
+					out:printc(line_color or colors[part], text:sub(off, off + chars -1))
+
+					pos = pos + chars
+					off = off + chars
+				end
+
+				-- Remaining part is partially inside override
+				if off <= len then
+					local chars = math.min(len - off +1, override.finish - pos)
+
+					out:printc(override.color, text:sub(off, off + chars -1))
+
+					pos = pos + chars
+					off = off + chars
+				end
+
+				-- Text still has remaining part? Restart with new override
+				if off <= len then
+					break
+				end
+
+				-- Erase offset for new text (if any)
+				if strings[part +1] then
+					off = 1
+				end
+			end
+		end
+
+		-- No more overrides, finish active string
+		out:printc(line_color or colors[part], strings[part]:sub(off))
+
+		-- Render remaining parts as normal
+		for part, text in ipairs_ex(strings, part +1) do
+			out:printc(line_color or colors[part], text)
+		end
+	end
+
 	-- Internal state
-	local idx     = 0
-	local strings = {}
-	local colors  = {}
+	local to_render = 0
+	local history   = {}
+
+	local idx
+	local colors
+	local strings
 
 	function stream:init(options)
 		
@@ -617,7 +748,17 @@ function grep_stream(out, pattern)
 			if ignorecase then
 				pattern = pattern:lower()
 			end
+
+			-- Allow limiting for match area
+			render_all = not options.greparea
 		end
+
+		-- Reset internal state
+		history = {}
+
+		idx     = 0
+		colors  = {}
+		strings = {}
 
 		-- Initialize base stream
 		out:init(options)
@@ -629,6 +770,7 @@ function grep_stream(out, pattern)
 			return
 		end
 
+		-- Store current line in history
 		idx = idx +1
 
 		colors[idx]  = color
@@ -641,99 +783,64 @@ function grep_stream(out, pattern)
 			return
 		end
 
-		-- Newline means we have to match against our grep, merge line
-		local merge     = table.concat(strings)
-		local overrides = {}
+		-- Line finished, check if it has a match
+		local overrides = find_matches(strings)
 
-		if ignorecase then
-			merge = merge:lower()
-		end
-
-		-- Match the grep against our line as long as it does
-		local from = 1
-
-		while true do
-			local start, finish, A, B = string.find(merge, pattern, from, false)
-
-			if not start then
-				break
-			end
-
-			table.insert(overrides, { start = start, finish = finish, color = match_color })
-
-			-- TODO: Find capture groups?
-
-			from = finish +1
-		end
-
+		-- No match
 		if not overrides[1] then
-			-- No match, just render as normal values
-			for part, text in ipairs(strings) do
-				out:printc(colors[part], text)
-			end
-		else
-			-- Render output, while watching overrides
-			local part = 1
-			local off  = 1
+			if render_all then
+				render_line(colors, strings)
+				out:newl()
+			else
+				if to_render > 0 then
+					to_render = to_render -1
 
-			local pos = 0
+					render_line(colors, strings)
+					out:newl()
 
-			for _, override in ipairs(overrides) do
-				for idx, text in ipairs_ex(strings, part) do
-					part = idx
-
-					-- Text has part before override start, print normally
-					local start = override.start - pos -1
-					local len   = text:len()
-
-					if start > 0 then
-						local chars = math.min(len - off +1, start)
-
-						out:printc(line_color or colors[part], text:sub(off, off + chars -1))
-
-						pos = pos + chars
-						off = off + chars
+					if to_render == 0 then
+						out:printc(COLOR_GENERIC, "...")
+						out:newl()
 					end
-
-					-- Remaining part is partially inside override
-					if off <= len then
-						local chars = math.min(len - off +1, override.finish - pos)
-
-						out:printc(override.color, text:sub(off, off + chars -1))
-
-						pos = pos + chars
-						off = off + chars
-					end
-
-					-- Text still has remaining part? Restart with new override
-					if off <= len then
-						break
-					end
-
-					-- Erase offset for new text (if any)
-					if strings[part +1] then
-						off = 1
-					end
+				else
+					table.insert(history, 1, colors)   history[match_pre * 2 +1] = nil
+					table.insert(history, 1, strings)  history[match_pre * 2 +1] = nil
 				end
 			end
+		else
+			if not render_all then
+				-- Render saved history
+				local saved = #history
 
-			-- No more overrides, finish active string
-			out:printc(line_color or colors[part], strings[part]:sub(off))
+				if saved > 0 then
+					out:printc(COLOR_GENERIC, "Matched area:")
+					out:newl()
+				end
 
-			-- Render remaining parts as normal
-			for part, text in ipairs_ex(strings, part +1) do
-				out:printc(line_color or colors[part], text)
+				for idx = saved, 1, -2 do
+					local colors  = history[idx -0]
+					local strings = history[idx -1]
+
+					render_line(colors, strings)
+					out:newl()
+
+					history[idx -0] = nil
+					history[idx -1] = nil
+				end
+
+				-- Queue next X lines to print anyway
+				to_render = match_post
 			end
+
+			-- Render matched line
+			render_line(colors, strings, overrides)
+			out:newl()
 		end
 
-		-- Clear state
-		idx = 0
-
-		colors  = {}
+		-- Start new line
+		idx     = 0
 		strings = {}
-
-		-- Finished!
-		out:newl()
+		colors  = {}
 	end
 
 	return stream
